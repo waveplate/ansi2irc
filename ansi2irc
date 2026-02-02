@@ -1,0 +1,750 @@
+#!/usr/bin/env python3
+"""
+ansi2irc — bidirectional converter between IRC and ANSI
+
+Features:
+- Converts irc2ansi and ansi2irc (auto-detect or explicit via --direction)
+- Builds fast lookup tables between IRC99 and ANSI256 palettes; caches them
+- Nearest-colour search separates chroma from luma: chromatic→chromatic, grayscale→grayscale
+- Streams: reads from STDIN and writes to STDOUT
+- Virtual Terminal implementation for proper cursor handling in ansi2irc
+
+Notes:
+- IRC control bytes used: Color ^C (0x03), Bold ^B (0x02), Underline ^_ (0x1F),
+  Reverse ^V (0x16), Italic ^] (0x1D), Reset ^O (0x0F)
+- ANSI SGR handled: 0 reset, 1 bold, 3 italic, 4 underline, 7 reverse,
+  22/23/24/27 attribute off, 30-37/90-97 fg, 40-47/100-107 bg,
+  38/48 256-colour (5;n) and truecolor (2;r;g;b)
+"""
+import argparse
+import json
+import os
+import re
+import sys
+from typing import Dict, List, Optional, Tuple, NamedTuple
+
+
+# === Palettes (indices are the colour codes) ===
+IRC99: List[int] = [
+    0xFFFFFF, 0x000000, 0x00007F, 0x009300, 0xFF0000, 0x7F0000, 0x9C009C, 0xFC7F00,
+    0xFFFF00, 0x00FC00, 0x009393, 0x00FFFF, 0x0000FC, 0xFF00FF, 0x555555, 0xAAAAAA,
+    0x470000, 0x472100, 0x474700, 0x324700, 0x004700, 0x00472C, 0x004747, 0x002747,
+    0x000047, 0x2E0047, 0x470047, 0x47002A, 0x740000, 0x743A00, 0x747400, 0x517400,
+    0x007400, 0x007449, 0x007474, 0x004074, 0x000074, 0x4B0074, 0x740074, 0x740045,
+    0xB50000, 0xB56300, 0xB5B500, 0x7DB500, 0x00B500, 0x00B571, 0x00B5B5, 0x0063B5,
+    0x0000B5, 0x7500B5, 0xB500B5, 0xB5006B, 0xFF0000, 0xFF8C00, 0xFFFF00, 0xB2FF00,
+    0x00FF00, 0x00FFA0, 0x00FFFF, 0x008CFF, 0x0000FF, 0xA500FF, 0xFF00FF, 0xFF0098,
+    0xFF5959, 0xFFB459, 0xFFFF71, 0xCFFF60, 0x6FFF6F, 0x65FFC9, 0x6DFFFF, 0x59B4FF,
+    0x5959FF, 0xC459FF, 0xFF66FF, 0xFF59BC, 0xFF9C9C, 0xFFD39C, 0xFFFF9C, 0xE2FF9C,
+    0x9CFF9C, 0x9CFFDB, 0x9CFFFF, 0x9CD3FF, 0x9C9CFF, 0xDC9CFF, 0xFF9CFF, 0xFF94D3,
+    0x000000, 0x131313, 0x282828, 0x363636, 0x4D4D4D, 0x656565, 0x818181, 0x9F9F9F,
+    0xBCBCBC, 0xE2E2E2, 0xFFFFFF,
+]
+
+ANSI256: List[int] = [
+    # 0-15: Standard & Bright
+    0x000000, 0xAA0000, 0x00AA00, 0xAA5500, 0x0000AA, 0xAA00AA, 0x00AAAA, 0xAAAAAA,
+    0x555555, 0xFF5555, 0x55FF55, 0xFFFF55, 0x5555FF, 0xFF55FF, 0x55FFFF, 0xFFFFFF,
+    # 16-231: 6x6x6 Cube
+    0x000000, 0x00005F, 0x000087, 0x0000AF, 0x0000D7, 0x0000FF, 0x005F00, 0x005F5F,
+    0x005F87, 0x005FAF, 0x005FD7, 0x005FFF, 0x008700, 0x00875F, 0x008787, 0x0087AF,
+    0x0087D7, 0x0087FF, 0x00AF00, 0x00AF5F, 0x00AF87, 0x00AFAF, 0x00AFD7, 0x00AFFF,
+    0x00D700, 0x00D75F, 0x00D787, 0x00D7AF, 0x00D7D7, 0x00D7FF, 0x00FF00, 0x00FF5F,
+    0x00FF87, 0x00FFAF, 0x00FFD7, 0x00FFFF, 0x5F0000, 0x5F005F, 0x5F0087, 0x5F00AF,
+    0x5F00D7, 0x5F00FF, 0x5F5F00, 0x5F5F5F, 0x5F5F87, 0x5F5FAF, 0x5F5FD7, 0x5F5FFF,
+    0x5F8700, 0x5F875F, 0x5F8787, 0x5F87AF, 0x5F87D7, 0x5F87FF, 0x5FAF00, 0x5FAF5F,
+    0x5FAF87, 0x5FAFAF, 0x5FAFD7, 0x5FAFFF, 0x5FD700, 0x5FD75F, 0x5FD787, 0x5FD7AF,
+    0x5FD7D7, 0x5FD7FF, 0x5FFF00, 0x5FFF5F, 0x5FFF87, 0x5FFFAF, 0x5FFFD7, 0x5FFFFF,
+    0x870000, 0x87005F, 0x870087, 0x8700AF, 0x8700D7, 0x8700FF, 0x875F00, 0x875F5F,
+    0x875F87, 0x875FAF, 0x875FD7, 0x875FFF, 0x878700, 0x87875F, 0x878787, 0x8787AF,
+    0x8787D7, 0x8787FF, 0x87AF00, 0x87AF5F, 0x87AF87, 0x87AFAF, 0x87AFD7, 0x87AFFF,
+    0x87D700, 0x87D75F, 0x87D787, 0x87D7AF, 0x87D7D7, 0x87D7FF, 0x87FF00, 0x87FF5F,
+    0x87FF87, 0x87FFAF, 0x87FFD7, 0x87FFFF, 0xAF0000, 0xAF005F, 0xAF0087, 0xAF00AF,
+    0xAF00D7, 0xAF00FF, 0xAF5F00, 0xAF5F5F, 0xAF5F87, 0xAF5FAF, 0xAF5FD7, 0xAF5FFF,
+    0xAF8700, 0xAF875F, 0xAF8787, 0xAF87AF, 0xAF87D7, 0xAF87FF, 0xAFAF00, 0xAFAF5F,
+    0xAFAF87, 0xAFAFAF, 0xAFAFD7, 0xAFAFFF, 0xAFD700, 0xAFD75F, 0xAFD787, 0xAFD7AF,
+    0xAFD7D7, 0xAFD7FF, 0xAFFF00, 0xAFFF5F, 0xAFFF87, 0xAFFFAF, 0xAFFFD7, 0xAFFFFF,
+    0xD70000, 0xD7005F, 0xD70087, 0xD700AF, 0xD700D7, 0xD700FF, 0xD75F00, 0xD75F5F,
+    0xD75F87, 0xD75FAF, 0xD75FD7, 0xD75FFF, 0xD78700, 0xD7875F, 0xD78787, 0xD787AF,
+    0xD787D7, 0xD787FF, 0xD7AF00, 0xD7AF5F, 0xD7AF87, 0xD7AFAF, 0xD7AFD7, 0xD7AFFF,
+    0xD7D700, 0xD7D75F, 0xD7D787, 0xD7D7AF, 0xD7D7D7, 0xD7D7FF, 0xD7FF00, 0xD7FF5F,
+    0xD7FF87, 0xD7FFAF, 0xD7FFD7, 0xD7FFFF, 0xFF0000, 0xFF005F, 0xFF0087, 0xFF00AF,
+    0xFF00D7, 0xFF00FF, 0xFF5F00, 0xFF5F5F, 0xFF5F87, 0xFF5FAF, 0xFF5FD7, 0xFF5FFF,
+    0xFF8700, 0xFF875F, 0xFF8787, 0xFF87AF, 0xFF87D7, 0xFF87FF, 0xFFAF00, 0xFFAF5F,
+    0xFFAF87, 0xFFAFAF, 0xFFAFD7, 0xFFAFFF, 0xFFD700, 0xFFD75F, 0xFFD787, 0xFFD7AF,
+    0xFFD7D7, 0xFFD7FF, 0xFFFF00, 0xFFFF5F, 0xFFFF87, 0xFFFFAF, 0xFFFFD7, 0xFFFFFF,
+    # 232-255: Grayscale Ramp
+    0x080808, 0x121212, 0x1C1C1C, 0x262626, 0x303030, 0x3A3A3A, 0x444444, 0x4E4E4E,
+    0x585858, 0x626262, 0x6C6C6C, 0x767676, 0x808080, 0x8A8A8A, 0x949494, 0x9E9E9E,
+    0xA8A8A8, 0xB2B2B2, 0xBCBCBC, 0xC6C6C6, 0xD0D0D0, 0xDADADA, 0xE4E4E4, 0xEEEEEE,
+]
+
+
+# === Utility: color math ===
+def unpack_rgb(rgb: int) -> Tuple[int, int, int]:
+    return ((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, (rgb >> 0) & 0xFF)
+
+
+def is_near_grayscale(col: int, tolerance: int) -> bool:
+    r, g, b = unpack_rgb(col)
+    return max(r, g, b) - min(r, g, b) <= tolerance
+
+def sq_distance(a: int, b: int) -> int:
+    ar, ag, ab = unpack_rgb(a)
+    br, bg, bb = unpack_rgb(b)
+    dr = ar - br
+    dg = ag - bg
+    db = ab - bb
+    return dr * dr + dg * dg + db * db
+
+def nearest_in_palette(col: int, palette: List[int], mask: Optional[List[bool]] = None) -> int:
+    best_i = 0
+    best_d = 1 << 62
+    for i, p in enumerate(palette):
+        if mask is not None and not mask[i]:
+            continue
+        d = sq_distance(col, p)
+        if d < best_d:
+            best_d = d
+            best_i = i
+            if d == 0:
+                break
+    return best_i
+
+def nearest_distinct(col: int, palette: List[int], tolerance: int) -> Optional[int]:
+    best_i: Optional[int] = None
+    best_d = 1 << 62
+    for i, p in enumerate(palette):
+        if is_near_grayscale(p, tolerance):
+            continue
+        d = sq_distance(col, p)
+        if d < best_d:
+            best_d = d
+            best_i = i
+            if d == 0:
+                break
+    return best_i
+
+
+# === Lookup table generation & cache ===
+CACHE_DIR = os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache"))
+CACHE_PATH = os.path.join(CACHE_DIR, "ansi2irc", "lookup.json")
+CACHE_VERSION = 2  # Incremented due to palette fix
+
+
+def build_lookup_tables(tolerance: int) -> Dict[str, List[int]]:
+    # Masks for grayscale vs chromatic buckets for each palette
+    irc_is_gray = [is_near_grayscale(c, tolerance) for c in IRC99]
+    ansi_is_gray = [is_near_grayscale(c, tolerance) for c in ANSI256]
+
+    # IRC→ANSI: for each IRC colour, map to nearest ANSI bucket-wise
+    irc_to_ansi: List[int] = [0] * len(IRC99)
+    for i, col in enumerate(IRC99):
+        if irc_is_gray[i]:
+            # restrict to grayscale ANSI
+            mask = ansi_is_gray
+            irc_to_ansi[i] = nearest_in_palette(col, ANSI256, mask)
+        else:
+            # prefer distinctly chromatic ANSI; fallback to general nearest
+            j = nearest_distinct(col, ANSI256, tolerance)
+            irc_to_ansi[i] = j if j is not None else nearest_in_palette(col, ANSI256)
+
+    # ANSI→IRC: for each ANSI colour, map to nearest IRC bucket-wise
+    ansi_to_irc: List[int] = [0] * len(ANSI256)
+    for i, col in enumerate(ANSI256):
+        if ansi_is_gray[i]:
+            mask = irc_is_gray
+            ansi_to_irc[i] = nearest_in_palette(col, IRC99, mask)
+        else:
+            j = nearest_distinct(col, IRC99, tolerance)
+            ansi_to_irc[i] = j if j is not None else nearest_in_palette(col, IRC99)
+
+    return {
+        "tolerance": tolerance,
+        "version": CACHE_VERSION,
+        "irc_to_ansi": irc_to_ansi,
+        "ansi_to_irc": ansi_to_irc,
+    }
+
+def ensure_cache_dirs(path: str) -> None:
+    d = os.path.dirname(path)
+    os.makedirs(d, exist_ok=True)
+
+def load_or_build_tables(tolerance: int, use_cache: bool, rebuild: bool) -> Dict[str, List[int]]:
+    if use_cache and not rebuild and os.path.exists(CACHE_PATH):
+        try:
+            with open(CACHE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if (
+                isinstance(data, dict)
+                and data.get("version") == CACHE_VERSION
+                and data.get("tolerance") == tolerance
+                and isinstance(data.get("irc_to_ansi"), list)
+                and isinstance(data.get("ansi_to_irc"), list)
+                and len(data["irc_to_ansi"]) == len(IRC99)
+                and len(data["ansi_to_irc"]) == len(ANSI256)
+            ):
+                return data
+        except Exception:
+            pass  # fall through to rebuild
+
+    data = build_lookup_tables(tolerance)
+    if use_cache:
+        try:
+            ensure_cache_dirs(CACHE_PATH)
+            tmp = CACHE_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            os.replace(tmp, CACHE_PATH)
+        except Exception:
+            pass
+    return data
+
+
+# === Conversion: IRC <-> ANSI ===
+# IRC control bytes
+IRC_COLOR = "\x03"
+IRC_BOLD = "\x02"
+IRC_UNDER = "\x1f"
+IRC_REVERSE = "\x16"
+IRC_ITALIC = "\x1d"
+IRC_RESET = "\x0f"
+
+# ANSI sequences helpers
+ESC = "\x1b"
+# Match all CSI sequences 
+ANSI_RE = re.compile(r"\x1b\[([0-9;:<=>?]*)([a-zA-Z@])")
+
+
+class AttrState:
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self.fg: Optional[int] = None  # code index in target palette
+        self.bg: Optional[int] = None
+        self.bold = False
+        self.under = False
+        self.reverse = False
+        self.italic = False
+
+    def copy(self) -> 'AttrState':
+        n = AttrState()
+        n.fg = self.fg
+        n.bg = self.bg
+        n.bold = self.bold
+        n.under = self.under
+        n.reverse = self.reverse
+        n.italic = self.italic
+        return n
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, AttrState):
+            return NotImplemented
+        return (self.fg == other.fg and self.bg == other.bg and 
+                self.bold == other.bold and self.under == other.under and 
+                self.reverse == other.reverse and self.italic == other.italic)
+
+
+class Cell(NamedTuple):
+    char: str
+    attr: AttrState
+
+class VirtualTerminal:
+    def __init__(self, width: int = 80):
+        self.width = width
+        self.grid: Dict[Tuple[int, int], Cell] = {}
+        self.cursor_x = 0
+        self.cursor_y = 0
+        self.saved_cursor = (0, 0)
+        self.current_attr = AttrState()
+        self.max_y = 0
+
+    def write(self, text: str) -> None:
+        for ch in text:
+            if ch == '\n':
+                self.cursor_y += 1
+                self.cursor_x = 0
+                self.max_y = max(self.max_y, self.cursor_y)
+            elif ch == '\r':
+                self.cursor_x = 0
+            elif ch == '\b':
+                self.cursor_x = max(0, self.cursor_x - 1)
+            elif ch == '\t':
+                # Tab stop every 8
+                self.cursor_x = (self.cursor_x // 8 + 1) * 8
+            elif ord(ch) >= 32:
+                # Wrap?
+                if self.width and self.cursor_x >= self.width:
+                    self.cursor_x = 0
+                    self.cursor_y += 1
+
+                self.grid[(self.cursor_x, self.cursor_y)] = Cell(ch, self.current_attr.copy())
+                self.cursor_x += 1
+                self.max_y = max(self.max_y, self.cursor_y)
+
+    def move_cursor(self, x: Optional[int] = None, y: Optional[int] = None, relative: bool = False) -> None:
+        if relative:
+            if x is not None: self.cursor_x += x
+            if y is not None: self.cursor_y += y
+        else:
+            if x is not None: self.cursor_x = x
+            if y is not None: self.cursor_y = y
+
+        # Clamp?
+        self.cursor_x = max(0, self.cursor_x)
+        self.cursor_y = max(0, self.cursor_y)
+        self.max_y = max(self.max_y, self.cursor_y)
+
+    def erase_in_display(self, mode: int) -> None:
+        # 2: clear all
+        if mode == 2:
+            self.grid.clear()
+            self.cursor_x = 0
+            self.cursor_y = 0
+            self.max_y = 0
+        elif mode == 0:
+            # Clear from cursor to end (simplified: just remove future keys?)
+            keys_to_remove = [k for k in self.grid if (k[1] > self.cursor_y) or (k[1] == self.cursor_y and k[0] >= self.cursor_x)]
+            for k in keys_to_remove:
+                del self.grid[k]
+        elif mode == 1:
+            # Clear from start to cursor
+            keys_to_remove = [k for k in self.grid if (k[1] < self.cursor_y) or (k[1] == self.cursor_y and k[0] <= self.cursor_x)]
+            for k in keys_to_remove:
+                del self.grid[k]
+
+    def erase_in_line(self, mode: int) -> None:
+        # 0: cursor to end
+        # 1: start to cursor
+        # 2: whole line
+        y = self.cursor_y
+        if mode == 0:
+            keys_to_remove = [k for k in self.grid if k[1] == y and k[0] >= self.cursor_x]
+        elif mode == 1:
+            keys_to_remove = [k for k in self.grid if k[1] == y and k[0] <= self.cursor_x]
+        elif mode == 2:
+            keys_to_remove = [k for k in self.grid if k[1] == y]
+        else:
+            return
+
+        for k in keys_to_remove:
+            del self.grid[k]
+
+    def save_cursor_pos(self) -> None:
+        self.saved_cursor = (self.cursor_x, self.cursor_y)
+
+    def restore_cursor_pos(self) -> None:
+        self.cursor_x, self.cursor_y = self.saved_cursor
+
+    def render(self) -> str:
+        # Convert grid to IRC string
+        lines = []
+        # Find bounds
+        if not self.grid:
+            return ""
+
+        real_max_y = max(k[1] for k in self.grid.keys())
+
+        for y in range(real_max_y + 1):
+            line_parts = []
+
+            line_cells = {k[0]: v for k, v in self.grid.items() if k[1] == y}
+            if not line_cells:
+                lines.append("")
+                continue
+
+            max_line_x = max(line_cells.keys())
+
+            last_attr = AttrState() # Reset at start of line
+
+            current_x = 0
+            while current_x <= max_line_x:
+                cell = line_cells.get(current_x)
+                if cell:
+                    new_attr = cell.attr
+                    changes = []
+
+                    color_changed = (new_attr.fg != last_attr.fg) or (new_attr.bg != last_attr.bg)
+
+                    if new_attr.bold != last_attr.bold:
+                        changes.append(IRC_BOLD)
+                        last_attr.bold = new_attr.bold
+                    if new_attr.italic != last_attr.italic:
+                        changes.append(IRC_ITALIC)
+                        last_attr.italic = new_attr.italic
+                    if new_attr.under != last_attr.under:
+                        changes.append(IRC_UNDER)
+                        last_attr.under = new_attr.under
+                    if new_attr.reverse != last_attr.reverse:
+                        changes.append(IRC_REVERSE)
+                        last_attr.reverse = new_attr.reverse
+
+                    if color_changed:
+                        if new_attr.fg is None and new_attr.bg is None:
+                             changes.append(IRC_COLOR) # Reset color
+                        elif new_attr.fg is not None and new_attr.bg is not None:
+                            changes.append(f"{IRC_COLOR}{new_attr.fg:02d},{new_attr.bg:02d}")
+                        elif new_attr.fg is not None:
+                            changes.append(f"{IRC_COLOR}{new_attr.fg:02d}")
+                        elif new_attr.bg is not None:
+                             changes.append(f"{IRC_COLOR},{new_attr.bg:02d}")
+
+                        last_attr.fg = new_attr.fg
+                        last_attr.bg = new_attr.bg
+
+                    line_parts.append("".join(changes))
+                    line_parts.append(cell.char)
+                else:
+                    default_attr = AttrState()
+                    if last_attr != default_attr:
+                         changes = []
+                         changes.append(IRC_RESET)
+                         last_attr = default_attr
+                         line_parts.append("".join(changes))
+
+                    line_parts.append(" ")
+
+                current_x += 1
+
+            line_parts.append(IRC_RESET)
+            lines.append("".join(line_parts))
+
+        return "\n".join(lines)
+
+
+def make_sgr(state: AttrState, fg_code: Optional[int], bg_code: Optional[int], truecolor: bool = False) -> str:
+    parts: List[str] = ["0"]  # start from reset for simplicity and correctness
+    if fg_code is not None:
+        if truecolor:
+            r, g, b = unpack_rgb(fg_code)
+            parts += ["38", "2", str(r), str(g), str(b)]
+        else:
+            parts += ["38", "5", str(fg_code)]
+    if bg_code is not None:
+        if truecolor:
+            r, g, b = unpack_rgb(bg_code)
+            parts += ["48", "2", str(r), str(g), str(b)]
+        else:
+            parts += ["48", "5", str(bg_code)]
+    if state.bold:
+        parts.append("1")
+    if state.italic:
+        parts.append("3")
+    if state.under:
+        parts.append("4")
+    if state.reverse:
+        parts.append("7")
+
+    def fold(parts: List[str]) -> List[str]:
+        out: List[str] = []
+        i = 0
+        while i < len(parts):
+            if parts[i] in ("38", "48") and i + 2 < len(parts) and parts[i + 1] in ("2", "5"):
+                if parts[i+1] == "5":
+                    out.append(parts[i] + ";" + parts[i + 1] + ";" + parts[i + 2])
+                    i += 3
+                elif parts[i+1] == "2" and i + 4 < len(parts):
+                    out.append(parts[i] + ";" + parts[i + 1] + ";" + parts[i + 2] + ";" + parts[i + 3] + ";" + parts[i + 4])
+                    i += 5
+                else:
+                    out.append(parts[i])
+                    i += 1
+            else:
+                out.append(parts[i])
+                i += 1
+        return out
+
+    folded = fold(parts)
+    return ESC + "[" + ";".join(folded) + "m"
+
+
+def irc_to_ansi(text: str, tables: Dict[str, List[int]], truecolor: bool = False) -> str:
+    irc_to_ansi_map = tables["irc_to_ansi"]
+    out: List[str] = []
+    state = AttrState()
+
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == IRC_COLOR:
+            i += 1
+            start = i
+            fg: Optional[int] = None
+            bg: Optional[int] = None
+            j = i
+            while j < n and text[j].isdigit() and (j - i) < 2:
+                j += 1
+            if j > i:
+                try:
+                    fg = int(text[i:j])
+                except ValueError:
+                    fg = None
+                i = j
+                if i < n and text[i] == ",":
+                    i += 1
+                    k = i
+                    while k < n and text[k].isdigit() and (k - i) < 2:
+                        k += 1
+                    if k > i:
+                        try:
+                            bg = int(text[i:k])
+                        except ValueError:
+                            bg = None
+                        i = k
+            else:
+                state.fg = None
+                state.bg = None
+                out.append(make_sgr(state, None, None, truecolor))
+                continue
+
+            if fg is not None:
+                if truecolor:
+                    state.fg = IRC99[fg] if 0 <= fg < len(IRC99) else None
+                else:
+                    state.fg = irc_to_ansi_map[fg] if 0 <= fg < len(irc_to_ansi_map) else None
+            else:
+                state.fg = None
+            
+            if bg is not None:
+                if truecolor:
+                    state.bg = IRC99[bg] if 0 <= bg < len(IRC99) else None
+                else:
+                    state.bg = irc_to_ansi_map[bg] if 0 <= bg < len(irc_to_ansi_map) else None
+            else:
+                state.bg = None
+            out.append(make_sgr(state, state.fg, state.bg, truecolor))
+        elif ch == IRC_BOLD:
+            state.bold = not state.bold
+            out.append(make_sgr(state, state.fg, state.bg, truecolor))
+            i += 1
+        elif ch == IRC_UNDER:
+            state.under = not state.under
+            out.append(make_sgr(state, state.fg, state.bg, truecolor))
+            i += 1
+        elif ch == IRC_REVERSE:
+            state.reverse = not state.reverse
+            out.append(make_sgr(state, state.fg, state.bg, truecolor))
+            i += 1
+        elif ch == IRC_ITALIC:
+            state.italic = not state.italic
+            out.append(make_sgr(state, state.fg, state.bg, truecolor))
+            i += 1
+        elif ch == IRC_RESET:
+            state.reset()
+            out.append(ESC + "[0m")
+            i += 1
+        else:
+            out.append(ch)
+            i += 1
+    out.append(ESC + "[0m")
+    return "".join(out)
+
+def rgb_to_irc_code(rgb: int, tolerance: int) -> int:
+    gray = is_near_grayscale(rgb, tolerance)
+    irc_is_gray = [is_near_grayscale(c, tolerance) for c in IRC99]
+    if gray:
+        return nearest_in_palette(rgb, IRC99, mask=irc_is_gray)
+    j = nearest_distinct(rgb, IRC99, tolerance)
+    return j if j is not None else nearest_in_palette(rgb, IRC99)
+
+def ansi_to_irc(text: str, tables: Dict[str, List[int]], tolerance: int, wrap_width: Optional[int] = None) -> str:
+    ansi_to_irc_map = tables["ansi_to_irc"]
+
+    # Initialize Virtual Terminal
+    # width is wrap_width (can be None)
+    vt = VirtualTerminal(width=wrap_width)
+
+    pos = 0
+    for m in ANSI_RE.finditer(text):
+        if m.start() > pos:
+            vt.write(text[pos:m.start()])
+
+        params_str = m.group(1)
+        cmd = m.group(2)
+
+        params = []
+        if params_str:
+            for p in params_str.split(';'):
+                 if p.isdigit():
+                     params.append(int(p))
+                 else:
+                     params.append(0)
+
+        def get_param(idx: int, default: int = 1) -> int:
+            if idx < len(params) and params[idx] != 0:
+                return params[idx]
+            return default
+
+        if cmd == 'A': 
+            n = get_param(0, 1)
+            vt.move_cursor(y=-n, relative=True)
+        elif cmd == 'B': 
+            n = get_param(0, 1)
+            vt.move_cursor(y=n, relative=True)
+        elif cmd == 'C': 
+            n = get_param(0, 1)
+            vt.move_cursor(x=n, relative=True)
+        elif cmd == 'D': 
+            n = get_param(0, 1)
+            vt.move_cursor(x=-n, relative=True)
+        elif cmd == 'H' or cmd == 'f': 
+            row = get_param(0, 1) - 1
+            col = get_param(1, 1) - 1
+            vt.move_cursor(x=col, y=row)
+        elif cmd == 'J': 
+            mode = get_param(0, 0)
+            vt.erase_in_display(mode)
+        elif cmd == 'K': 
+            mode = get_param(0, 0)
+            vt.erase_in_line(mode)
+        elif cmd == 's': 
+            vt.save_cursor_pos()
+        elif cmd == 'u': 
+            vt.restore_cursor_pos()
+        elif cmd == 'm': 
+            i = 0
+            if not params:
+                params = [0]
+
+            while i < len(params):
+                p = params[i]
+                if p == 0:
+                    vt.current_attr.reset()
+                elif p == 1:
+                    vt.current_attr.bold = True
+                elif p == 22:
+                    vt.current_attr.bold = False
+                elif p == 3:
+                    vt.current_attr.italic = True
+                elif p == 23:
+                    vt.current_attr.italic = False
+                elif p == 4:
+                    vt.current_attr.under = True
+                elif p == 24:
+                    vt.current_attr.under = False
+                elif p == 7:
+                    vt.current_attr.reverse = True
+                elif p == 27:
+                    vt.current_attr.reverse = False
+                elif p == 39:
+                    vt.current_attr.fg = None
+                elif p == 49:
+                    vt.current_attr.bg = None
+                elif 30 <= p <= 37:
+                    idx = p - 30
+                    vt.current_attr.fg = ansi_to_irc_map[idx]
+                elif 90 <= p <= 97:
+                    idx = p - 90 + 8
+                    vt.current_attr.fg = ansi_to_irc_map[idx]
+                elif 40 <= p <= 47:
+                    idx = p - 40
+                    vt.current_attr.bg = ansi_to_irc_map[idx]
+                elif 100 <= p <= 107:
+                    idx = p - 100 + 8
+                    vt.current_attr.bg = ansi_to_irc_map[idx]
+                elif p == 38: 
+                    if i + 2 < len(params) and params[i+1] == 5:
+                        idx = params[i+2]
+                        vt.current_attr.fg = ansi_to_irc_map[idx] if idx < len(ansi_to_irc_map) else 0
+                        i += 2
+                    elif i + 4 < len(params) and params[i+1] == 2:
+                        r, g, b = params[i+2], params[i+3], params[i+4]
+                        rgb = (r << 16) | (g << 8) | b
+                        vt.current_attr.fg = rgb_to_irc_code(rgb, tolerance)
+                        i += 4
+                    else:
+                        pass 
+                elif p == 48: 
+                    if i + 2 < len(params) and params[i+1] == 5:
+                        idx = params[i+2]
+                        vt.current_attr.bg = ansi_to_irc_map[idx] if idx < len(ansi_to_irc_map) else 0
+                        i += 2
+                    elif i + 4 < len(params) and params[i+1] == 2:
+                        r, g, b = params[i+2], params[i+3], params[i+4]
+                        rgb = (r << 16) | (g << 8) | b
+                        vt.current_attr.bg = rgb_to_irc_code(rgb, tolerance)
+                        i += 4
+                    else:
+                        pass
+
+                i += 1
+
+        pos = m.end()
+
+    if pos < len(text):
+        vt.write(text[pos:])
+
+    return vt.render()
+
+def detect_direction(sample: str) -> str:
+    if ANSI_RE.search(sample):
+        return "irc"
+    if any(c in sample for c in (IRC_COLOR, IRC_BOLD, IRC_UNDER, IRC_REVERSE, IRC_ITALIC, IRC_RESET)):
+        return "ansi"
+    return "irc"
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Convert between ANSI SGR and IRC color/control codes")
+    ap.add_argument("-d", "--direction", choices=["irc", "ansi", "auto"], default="auto",
+                    help="Conversion direction (default: auto-detect)")
+    ap.add_argument("-t", "--tolerance", type=int, default=16,
+                    help="Grayscale tolerance for chroma separation (default: 16)")
+    ap.add_argument("-e", "--encoding", help="Input encoding")
+    ap.add_argument("--cp437", action="store_true", help="Force CP437 encoding (suitable for ANSI art)")
+    ap.add_argument("-w", "--width", type=int, default=None, help="Wrap width for ansi2irc (default: 80 if cp437)")
+    ap.add_argument("--truecolor", action="store_true", help="Use 24-bit Truecolor ANSI output instead of 256-color palette")
+    ap.add_argument("-c", "--no-cache", action="store_true", help="Do not read/write cache")
+    ap.add_argument("-r", "--rebuild", action="store_true", help="Force rebuild lookup tables")
+    ap.add_argument("file", nargs="?", help="Input file (default: stdin)")
+    args = ap.parse_args()
+
+    use_cache = not args.no_cache
+    tables = load_or_build_tables(args.tolerance, use_cache=use_cache, rebuild=args.rebuild)
+
+    if args.file:
+        try:
+            input_stream = open(args.file, "rb")
+        except Exception as e:
+            sys.stderr.write(f"Error opening file {args.file}: {e}\n")
+            sys.exit(1)
+    else:
+        input_stream = sys.stdin.buffer
+
+    with input_stream:
+        raw_data = input_stream.read()
+
+    data: Optional[str] = None
+
+    encoding = args.encoding
+    if args.cp437:
+        encoding = "cp437"
+
+    if encoding:
+        try:
+            data = raw_data.decode(encoding)
+        except Exception as e:
+            sys.stderr.write(f"Error decoding input with {encoding}: {e}\n")
+            sys.exit(1)
+    else:
+        try:
+            data = raw_data.decode("utf-8")
+        except UnicodeDecodeError:
+            data = raw_data.decode("latin1", errors="replace")
+
+    direction = args.direction
+    if direction == "auto":
+        direction = detect_direction(data)
+
+    if direction == "ansi":
+        sys.stdout.write(irc_to_ansi(data, tables, truecolor=args.truecolor))
+    else:
+        wrap_width = args.width
+        if wrap_width is None and args.cp437:
+            wrap_width = 80
+        sys.stdout.write(ansi_to_irc(data, tables, args.tolerance, wrap_width=wrap_width))
+
+
+if __name__ == "__main__":
+    main()
