@@ -381,14 +381,22 @@ class VirtualTerminal:
                         last_attr.reverse = new_attr.reverse
 
                     if color_changed:
-                        if new_attr.fg is None and new_attr.bg is None:
-                             changes.append(IRC_COLOR) # Reset color
-                        elif new_attr.fg is not None and new_attr.bg is not None:
-                            changes.append(f"{IRC_COLOR}{new_attr.fg:02d},{new_attr.bg:02d}")
-                        elif new_attr.fg is not None:
-                            changes.append(f"{IRC_COLOR}{new_attr.fg:02d}")
-                        elif new_attr.bg is not None:
-                             changes.append(f"{IRC_COLOR},{new_attr.bg:02d}")
+                        def is_valid(val):
+                            return str(val).isnumeric()
+
+                        fg_val = new_attr.fg
+                        bg_val = new_attr.bg
+
+                        if is_valid(fg_val) and is_valid(bg_val):
+                            changes.append(f"{IRC_COLOR}{fg_val},{bg_val}")
+                        elif is_valid(fg_val):
+                            changes.append(f"{IRC_COLOR}{fg_val}")
+                        elif is_valid(bg_val) and is_valid(last_attr.fg):
+                            changes.append(f"{IRC_COLOR}{last_attr.fg},{bg_val}")
+                        elif is_valid(bg_val):
+                            changes.append(f"{IRC_COLOR}{bg_val},{bg_val}")
+                        else:
+                            changes.append(IRC_COLOR)
 
                         last_attr.fg = new_attr.fg
                         last_attr.bg = new_attr.bg
@@ -504,16 +512,12 @@ def irc_to_ansi(text: str, tables: Dict[str, List[int]], truecolor: bool = False
                     state.fg = IRC99[fg] if 0 <= fg < len(IRC99) else None
                 else:
                     state.fg = irc_to_ansi_map[fg] if 0 <= fg < len(irc_to_ansi_map) else None
-            else:
-                state.fg = None
-            
             if bg is not None:
                 if truecolor:
                     state.bg = IRC99[bg] if 0 <= bg < len(IRC99) else None
                 else:
                     state.bg = irc_to_ansi_map[bg] if 0 <= bg < len(irc_to_ansi_map) else None
-            else:
-                state.bg = None
+
             out.append(make_sgr(state, state.fg, state.bg, truecolor))
         elif ch == IRC_BOLD:
             state.bold = not state.bold
